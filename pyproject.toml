@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patent-science-linker"
+version = "0.1.0"
+description = "Company → Patents → OAIDs pipeline using Lens + DuckDB + OpenAlex"
+authors = [{name = "Logan Whitehair"}]
+requires-python = ">=3.10"
+dependencies = []

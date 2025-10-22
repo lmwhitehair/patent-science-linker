@@ -1,0 +1,10 @@
+﻿duckdb
+pyarrow
+pandas
+requests
+tenacity
+python-dotenv
+typer
+rich
+pyalex
+xlsxwriter
