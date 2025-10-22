@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+.pytest_cache/
+
+# Notebooks & checkpoints
+.ipynb_checkpoints/
+
+# Data/output (adjust paths to your repo)
+data/
+outputs/
+artifacts/
+logs/
+*.csv
+*.parquet
+*.arrow
+*.xlsx
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
