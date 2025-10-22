@@ -4,12 +4,15 @@ __pycache__/
 .venv/
 .env
 .env.*
-.pytest_cache/
 
-# Notebooks & checkpoints
-.ipynb_checkpoints/
+# IDE / OS
+.vscode/
+.idea/
+.vs/
+.DS_Store
+Thumbs.db
 
-# Data/output (adjust paths to your repo)
+# Data & outputs
 data/
 outputs/
 artifacts/
@@ -19,10 +22,5 @@ logs/
 *.arrow
 *.xlsx
 
-# IDEs
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
+# Jupyter
+.ipynb_checkpoints/
