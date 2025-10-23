@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import os
+import re
 import pandas as pd
 import typer
 from dotenv import load_dotenv
@@ -33,40 +34,44 @@ def outdir() -> Path:
     return d
 
 
-@app.command()
-def run(
-    company: str = typer.Option(..., help="Company/assignee/owner name (exact-match variants generated)."),
-    confscore: int = typer.Option(8, help="Minimum confscore to accept a citation match."),
-    aliases_file: str | None = typer.Option(None, help="Extra aliases (one per line; '#' comments allowed)."),
-    include_predecessors: bool = typer.Option(False, help="Include known predecessor names (mergers/legacy)."),
-    limit: Optional[int] = typer.Option(None, help="Overall max patent records (post de-dup)."),
-    pcs_path: Optional[str] = typer.Option(None, help="Override PCS path (else env PCS_PATH)."),
-    pcs_format: Optional[str] = typer.Option(None, help="parquet or csv (else env PCS_FORMAT)."),
-    wherefound: Optional[List[str]] = typer.Option(None, help="Filter citations by wherefound (repeatable)."),
-    reftype: Optional[List[str]] = typer.Option(None, help="Filter citations by reftype (repeatable)."),
-    enrich_kind: bool = typer.Option(True, help="Use PatentsView to fetch kind codes for pubnorms."),
-    assignment_source: str = typer.Option(
-        "uspto", help="Source for collecting starting patents: 'uspto' or 'lens'"
-    ),
-    fallback_lens: bool = typer.Option(
-        False, help="Fallback to Lens company search if USPTO assignments fail."
-    ),
-):
+def _sanitize_sheet_name(name: str) -> str:
+    # Remove forbidden chars and trim to 31
+    cleaned = re.sub(r"[:\\/*?\[\]]", " ", name).strip()
+    if len(cleaned) > 31:
+        cleaned = cleaned[:31].rstrip()
+    if not cleaned:
+        cleaned = "Sheet"
+    return cleaned
 
+
+def _build_evidence_for_company(
+    company: str,
+    *,
+    confscore: int,
+    aliases_file: Optional[str],
+    include_predecessors: bool,
+    limit: Optional[int],
+    pcs_path: Optional[str],
+    pcs_format: Optional[str],
+    wherefound: Optional[List[str]],
+    reftype: Optional[List[str]],
+    enrich_kind: bool,
+    assignment_source: str,
+    fallback_lens: bool,
+):
     typer.echo(f"Starting pipeline for: {company}")
 
-    # --- aliases ---
+    # aliases
     extra: list[str] = []
     if aliases_file:
         with open(aliases_file, "r", encoding="utf-8") as f:
             extra = [line.strip() for line in f if line.strip() and not line.startswith("#")]
     aliases = seed_aliases(company, extra=extra, include_predecessors=include_predecessors)
-
     preview = aliases[:3]
     more = " ..." if len(aliases) > 3 else ""
     typer.echo(f"Aliases: {len(aliases)} -> {preview}{more}")
 
-    # --- collect starting set of pubnorms ---
+    # collect starting pubnorms
     pubnorms: list[str] = []
 
     def _collect_via_lens(a_list: list[str], limit_val: Optional[int]) -> list[str]:
@@ -84,19 +89,16 @@ def run(
                 include_minimal=True,
             )
             for r in recs:
-                # Try top-level publication fields first
                 pubref = None
                 j = (r.get("jurisdiction") or "").upper()
                 dn = r.get("doc_number")
                 kd = r.get("kind")
                 if j and dn:
                     pubref = {"jurisdiction": j, "doc_number": dn, "kind": kd}
-                # Else look into biblio.publication_reference
                 if not pubref:
                     bibl = r.get("biblio") or {}
                     pubref = bibl.get("publication_reference")
                 key = from_lens_publication_reference(pubref) if pubref else None
-                # Restrict to US to keep parity with the USPTO-based flow
                 if key and key.startswith("us-") and key not in seen:
                     seen.add(key)
                     out.append(key)
@@ -106,19 +108,16 @@ def run(
     if assignment_source.lower() == "lens":
         pubnorms = _collect_via_lens(aliases, limit)
     else:
-        # Default: USPTO Assignments
         try:
             us_patents, us_apps = collect_numbers_for_parties(aliases)
             typer.echo(
                 f"USPTO Assignments returned {len(us_patents)} US patent numbers and {len(us_apps)} application numbers."
             )
-            # normalize patent numbers (remove commas/spaces)
             norm_nums = [normalize_doc_number(x).replace("/", "") for x in us_patents]
-            norm_nums = [n for n in norm_nums if n]  # drop empties
+            norm_nums = [n for n in norm_nums if n]
             if limit is not None and len(norm_nums) > limit:
                 norm_nums = norm_nums[:limit]
                 typer.echo(f"Limiting to first {limit} patent numbers for downstream steps.")
-            # optional enrichment for kind codes
             kind_map: dict[str, str] = {}
             if enrich_kind:
                 if not HAS_PATENTSVIEW:
@@ -127,50 +126,29 @@ def run(
                     typer.echo("Fetching kind codes from PatentsView.")
                     kind_map = fetch_kinds_for_patent_numbers(norm_nums)
                     typer.echo(f"Kind codes resolved for {len(kind_map)} / {len(norm_nums)} patents.")
-            # build pubnorms
             for num in norm_nums:
                 kind = kind_map.get(num)
+                # include both kinded and unkinded variants to maximize join hits
                 pubnorms.append(build_pubnorm("US", num, kind))
+                pubnorms.append(build_pubnorm("US", num, None))
         except Exception as e:
             typer.echo("Error querying USPTO Assignments.")
             typer.echo(str(e))
             if fallback_lens:
                 pubnorms = _collect_via_lens(aliases, limit)
             else:
-                raise typer.Exit(code=1)
+                raise
 
-    typer.echo(
-        f"USPTO Assignments returned {len(us_patents)} US patent numbers and {len(us_apps)} application numbers."
-    )
-
-    if not us_patents and not us_apps:
-        typer.echo("No assignment-linked identifiers found for that company/aliases.")
-        raise typer.Exit(code=0)
-
-    # normalize patent numbers (remove commas/spaces)
-    norm_nums = [normalize_doc_number(x).replace("/", "") for x in us_patents]
-    # strictly US here; assignment feed is USPTO. If you later pull EP/WO, adapt jurisdiction logic.
-    norm_nums = [n for n in norm_nums if n]  # drop empties
-
-    # Optional: limit (helps with very large owners)
-    if limit is not None and len(norm_nums) > limit:
-        norm_nums = norm_nums[:limit]
-        typer.echo(f"Limiting to first {limit} patent numbers for downstream steps.")
-
-    # --- optional enrichment for kind codes ---
-    kind_map: dict[str, str] = {}
-    if enrich_kind:
-        if not HAS_PATENTSVIEW:
-            typer.echo("[note] patentsview_client not available; skipping kind enrichment.")
-        else:
-            typer.echo("Fetching kind codes from PatentsView.")
-            kind_map = fetch_kinds_for_patent_numbers(norm_nums)
-            typer.echo(f"Kind codes resolved for {len(kind_map)} / {len(norm_nums)} patents.")
-
-    pubnorms = sorted(set(pubnorms))
+    # De-duplicate and also include unkinded variants for any kinded keys from any source
+    base_set = set(pubnorms)
+    for key in list(base_set):
+        parts = key.split("-")
+        if len(parts) >= 3:
+            base_set.add(f"{parts[0]}-{parts[1]}")
+    pubnorms = sorted(base_set)
     if not pubnorms:
         typer.echo("Could not build any pubnorms from assignment results.")
-        raise typer.Exit(code=1)
+        return pd.DataFrame(), pd.DataFrame()
 
     typer.echo(f"Normalized to {len(pubnorms)} pubnorms. Starting DuckDB join.")
 
@@ -186,17 +164,15 @@ def run(
         pcs_format=pcs_format,
     )
     dfo = distinct_oaids(df)
-    # Preserve a raw evidence view for output
-    try:
-        df_evidence_raw = df[["patent", "oaid", "confscore", "reftype", "wherefound"]].copy()
-    except Exception:
-        df_evidence_raw = df.copy()
+    typer.echo(f"Evidence rows: {len(df)}; distinct OAIDs: {len(dfo)}")
 
-    # --- OpenAlex enrichment (paper metadata) ---
+    # OpenAlex enrichment (paper metadata)
     typer.echo("Enriching OpenAlex metadata (titles, years, abstracts, grants, funders).")
     rows = df.to_dict(orient="records")
+    # If no evidence rows, still emit one row per pubnorm with only patent populated
+    if not rows:
+        rows = [{"patent": p} for p in pubnorms]
 
-    # OAIDs from DuckDB may be ints; normalize to 'W.' strings
     def _norm_oaid(x):
         if x is None:
             return None
@@ -236,11 +212,8 @@ def run(
             r["paper_title"] = (w.get("title") or w.get("display_name") or "").strip()
             r["publication_year"] = w.get("publication_year") or ""
             r["abstract"] = (w.get("abstract") or "").strip()
-
-            # pretty funder names (already flattened in client)
             r["funder"] = join_unique(w.get("_funders_list") or [])
 
-            # grants as "FunderName:AwardID"
             grant_bits = []
             for g in (w.get("grants") or []):
                 fname = g.get("funder_display_name") or g.get("funder") or ""
@@ -253,7 +226,6 @@ def run(
             r["institutions"] = join_unique(w.get("_institutions_list") or [])
             r["award_ids"] = join_unique(w.get("_grants_award_ids") or [])
 
-            # Concepts: top N by score
             concept_names = []
             for c in (w.get("concepts") or []):
                 name = c.get("display_name")
@@ -262,7 +234,6 @@ def run(
             concept_names = [name for _, name in sorted(concept_names, reverse=True)]
             r["concepts"] = "; ".join(concept_names[:10])
 
-            # Topics
             topic_names = []
             for t in (w.get("topics") or []):
                 name = t.get("display_name")
@@ -271,7 +242,7 @@ def run(
             topic_names = [name for _, name in sorted(topic_names, reverse=True)]
             r["topics"] = "; ".join(topic_names)
 
-    # prune columns you don't want in the primary enriched sheet
+    # prune to enriched sheet
     for r in rows:
         for k in ("oaid", "confscore", "reftype", "wherefound"):
             r.pop(k, None)
@@ -289,31 +260,127 @@ def run(
     final_rows = [{k: r.get(k, "") for k in final_cols} for r in rows]
     df_final = pd.DataFrame(final_rows, columns=final_cols)
 
-    # Save outputs
-    out = outdir()
-    company_slug = company.lower().replace(" ", "_")
-    evidence_xlsx = out / f"{company_slug}_evidence.xlsx"
-    oaids_path = out / f"{company_slug}_oaids.csv"
-
     # Optional: blocker for empties (helps in xlsx to stop visual spill)
     BLOCKER = "\u2060"
     for col in ["grants", "award_ids", "institutions", "funder"]:
         if col in df_final.columns:
             df_final[col] = df_final[col].replace({"": BLOCKER})
 
+    return df_final, dfo
+
+
+@app.command()
+def run(
+    company: Optional[str] = typer.Option(None, help="Company/assignee/owner name (exact-match variants generated)."),
+    from_query: Optional[str] = typer.Option(None, help="Path to .txt file with one company per line."),
+    confscore: int = typer.Option(8, help="Minimum confscore to accept a citation match."),
+    aliases_file: str | None = typer.Option(None, help="Extra aliases (one per line; '#' comments allowed)."),
+    include_predecessors: bool = typer.Option(False, help="Include known predecessor names (mergers/legacy)."),
+    limit: Optional[int] = typer.Option(None, help="Overall max patent records (post de-dup)."),
+    pcs_path: Optional[str] = typer.Option(None, help="Override PCS path (else env PCS_PATH)."),
+    pcs_format: Optional[str] = typer.Option(None, help="parquet or csv (else env PCS_FORMAT)."),
+    wherefound: Optional[List[str]] = typer.Option(None, help="Filter citations by wherefound (repeatable)."),
+    reftype: Optional[List[str]] = typer.Option(None, help="Filter citations by reftype (repeatable)."),
+    enrich_kind: bool = typer.Option(True, help="Use PatentsView to fetch kind codes for pubnorms."),
+    assignment_source: str = typer.Option(
+        "uspto", help="Source for collecting starting patents: 'uspto' or 'lens'"
+    ),
+    fallback_lens: bool = typer.Option(
+        False, help="Fallback to Lens company search if USPTO assignments fail."
+    ),
+):
+    # Build company list: include --company plus all names from file (if provided)
+    companies: list[str] = []
+    if company:
+        companies.append(company.strip())
+    if from_query:
+        p = Path(from_query)
+        if not p.exists():
+            raise typer.BadParameter(f"Query file not found: {from_query}")
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                name = line.strip()
+                if name:
+                    companies.append(name)
+    # de-duplicate while preserving order
+    seen: set[str] = set()
+    companies = [c for c in companies if not (c in seen or seen.add(c))]
+
+    if not companies:
+        raise typer.BadParameter("Provide --company and/or --from_query with at least one name.")
+
+    out = outdir()
+
+    # If a query file is used, write a single combined workbook named after the file stem
+    if from_query:
+        stem = Path(from_query).stem
+        combined_xlsx = out / f"{stem}_evidence.xlsx"
+        typer.echo(f"Batch mode: {len(companies)} companies -> {combined_xlsx}")
+        used_sheet_names: set[str] = set()
+
+        with pd.ExcelWriter(combined_xlsx, engine="xlsxwriter") as writer:
+            fmt = writer.book.add_format({"text_wrap": False})
+            for comp in companies:
+                df_final, _ = _build_evidence_for_company(
+                    comp,
+                    confscore=confscore,
+                    aliases_file=aliases_file,
+                    include_predecessors=include_predecessors,
+                    limit=limit,
+                    pcs_path=pcs_path,
+                    pcs_format=pcs_format,
+                    wherefound=wherefound,
+                    reftype=reftype,
+                    enrich_kind=enrich_kind,
+                    assignment_source=assignment_source,
+                    fallback_lens=fallback_lens,
+                )
+
+                sheet = _sanitize_sheet_name(comp)
+                base = sheet
+                idx = 2
+                while sheet in used_sheet_names:
+                    suffix = f"-{idx}"
+                    sheet = (base[: 31 - len(suffix)] + suffix)[:31]
+                    idx += 1
+                used_sheet_names.add(sheet)
+
+                # Write only enriched evidence per company
+                df_final.to_excel(writer, index=False, sheet_name=sheet)
+                ws = writer.sheets[sheet]
+                ws.set_column(0, max(0, len(df_final.columns) - 1), None, fmt)
+
+        typer.echo(f"Wrote evidence: {combined_xlsx}")
+        return
+
+    # Single-company mode
+    comp = companies[0]
+    df_final, dfo = _build_evidence_for_company(
+        comp,
+        confscore=confscore,
+        aliases_file=aliases_file,
+        include_predecessors=include_predecessors,
+        limit=limit,
+        pcs_path=pcs_path,
+        pcs_format=pcs_format,
+        wherefound=wherefound,
+        reftype=reftype,
+        enrich_kind=enrich_kind,
+        assignment_source=assignment_source,
+        fallback_lens=fallback_lens,
+    )
+
+    company_slug = comp.lower().replace(" ", "_")
+    evidence_xlsx = out / f"{company_slug}_evidence.xlsx"
+    oaids_path = out / f"{company_slug}_oaids.csv"
+
     with pd.ExcelWriter(evidence_xlsx, engine="xlsxwriter") as writer:
-        # Enriched evidence sheet
         df_final.to_excel(writer, index=False, sheet_name="evidence")
         ws = writer.sheets["evidence"]
         fmt = writer.book.add_format({"text_wrap": False})
-        ws.set_column(0, len(df_final.columns) - 1, None, fmt)
+        ws.set_column(0, max(0, len(df_final.columns) - 1), None, fmt)
 
-        # Raw evidence sheet
-        df_evidence_raw.to_excel(writer, index=False, sheet_name="evidence_raw")
-        ws2 = writer.sheets["evidence_raw"]
-        ws2.set_column(0, len(df_evidence_raw.columns) - 1, None, fmt)
-
-    # OAIDs CSV is fine in plain CSV
+    # OAIDs CSV only in single-company mode
     dfo.to_csv(oaids_path, index=False)
 
     typer.echo(f"Wrote evidence: {evidence_xlsx}")
