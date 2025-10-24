@@ -54,11 +54,15 @@ def seed_aliases(company: str, extra: Iterable[str] | None = None, include_prede
         if any(s.startswith("LOCKHEED") or s.startswith("LOCKHEED MARTIN") for s in seeds):
             seeds.update(["LOCKHEED AIRCRAFT CORPORATION", "MARTIN MARIETTA CORPORATION", "SKUNK WORKS", "LOCKHEED CORPORATION"])
         if any(s.startswith("RAYTHEON") or s.startswith("RTX") for s in seeds):
-            seeds.update(["RAYTHEON TECHNOLOGIES CORPORATION", "UNITED TECHNOLOGIES CORPORATION", "RTX CORPORATION", "RAYTHEON COMPANY", "RAYTHEON INTELLIGENCE & SPACE", "RAYTHEON MISSILES & DEFENSE"])
-        if any(s.startswith("NORTHROP") for s in seeds):
+            seeds.update(["RAYTHEON TECHNOLOGIES CORPORATION", "RTX CORPORATION", "RAYTHEON COMPANY", "RAYTHEON INTELLIGENCE & SPACE", "RAYTHEON MISSILES & DEFENSE"])
+        if any(s.startswith("NORTHROP") or s.startswith("NORTHROP GRUMMAN CORP") for s in seeds):
             seeds.update(["NORTHROP CORPORATION", "NORTHROP GRUMMAN CORPORATION", "GRUMMAN CORPORATION", "NORTHROP GRUMMAN SYSTEMS CORPORATION", "NORTHROP GRUMMAN INNOVATION SYSTEMS LLC"])
         if any(s.startswith("BOEING") or s.startswith("BOEING CO") for s in seeds):
-            seeds.update(["BOEING DEFENSE, SPACE & SECURITY", "THE BOEING COMPANY"])
+            seeds.update(["BOEING DEFENSE SPACE & SECURITY", "THE BOEING COMPANY"])
+        if any(s.startswith("GENERAL DYNAMICS") or s.startswith("GENERAL DYNAMICS CORP") for s in seeds):
+            seeds.update(["GENERAL DYNAMICS AIR DEFENSE SYSTEMS","GENERAL DYNAMICS CORPORATION"])
+        if any(s.startswith("L3HARRIS TECHNOLOGIES INC") or s.startswith("L3HARRIS") for s in seeds):
+            seeds.update(["HARRIS GLOBAL COMMUNICATIONS IN", "L3HARRIS AVIATION PRODUCTS INC"])
 
     # Expand suffixes so one alias covers CORP/CORPORATION/CO/COMPANY/etc.
     expanded = set()

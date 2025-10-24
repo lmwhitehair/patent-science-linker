@@ -12,13 +12,16 @@ from dotenv import load_dotenv
 
 from .company_query import seed_aliases
 from .normalizer import build_pubnorm, normalize_doc_number, from_lens_publication_reference
-from .uspto_assignment_client import collect_numbers_for_parties_ac as collect_numbers_for_parties
 from .openalex_client import fetch_works_by_ids
 from .lens_client import fetch_company_patents
 
 # optional enrichment
 try:
-    from .patentsview_client import fetch_kinds_for_patent_numbers
+    from .patentsview_client import (
+        CompanyPatentResult,
+        fetch_kinds_for_patent_numbers,
+        fetch_patents_for_company,
+    )
     HAS_PATENTSVIEW = True
 except Exception:
     HAS_PATENTSVIEW = False
@@ -56,7 +59,7 @@ def _build_evidence_for_company(
     wherefound: Optional[List[str]],
     reftype: Optional[List[str]],
     enrich_kind: bool,
-    assignment_source: str,
+    patent_source: str,
     fallback_lens: bool,
 ):
     typer.echo(f"Starting pipeline for: {company}")
@@ -105,19 +108,47 @@ def _build_evidence_for_company(
         typer.echo(f"Lens returned {len(out)} US pubnorms across aliases.")
         return out
 
-    if assignment_source.lower() == "lens":
+    if patent_source.lower() == "lens":
         pubnorms = _collect_via_lens(aliases, limit)
     else:
         try:
-            us_patents, us_apps = collect_numbers_for_parties(aliases)
+            if not HAS_PATENTSVIEW:
+                raise RuntimeError("patentsview_client not available in this environment.")
+
+            result: CompanyPatentResult = fetch_patents_for_company(aliases, limit=limit)
+            alias_without_ids = [a for a, hits in result.alias_hits.items() if not hits]
             typer.echo(
-                f"USPTO Assignments returned {len(us_patents)} US patent numbers and {len(us_apps)} application numbers."
+                f"PatentsView returned {len(result.patents)} patent records across {len(result.assignee_ids)} assignee IDs."
             )
-            norm_nums = [normalize_doc_number(x).replace("/", "") for x in us_patents]
-            norm_nums = [n for n in norm_nums if n]
+            if alias_without_ids:
+                preview = alias_without_ids[:3]
+                more = " ..." if len(alias_without_ids) > 3 else ""
+                typer.echo(f"[note] No disambiguated IDs for aliases: {preview}{more}")
+            if result.fallback_used:
+                typer.echo("[note] PatentsView fallback: direct name search used for some aliases.")
+
+            norm_nums = []
+            for rec in result.patents:
+                pid = rec.get("patent_id")
+                if not pid:
+                    continue
+                norm = normalize_doc_number(str(pid)).replace("/", "")
+                if norm:
+                    norm_nums.append(norm)
+
+            # preserve order while de-duplicating
+            seen_norms: set[str] = set()
+            deduped: list[str] = []
+            for n in norm_nums:
+                if n not in seen_norms:
+                    seen_norms.add(n)
+                    deduped.append(n)
+            norm_nums = deduped
+
             if limit is not None and len(norm_nums) > limit:
                 norm_nums = norm_nums[:limit]
                 typer.echo(f"Limiting to first {limit} patent numbers for downstream steps.")
+
             kind_map: dict[str, str] = {}
             if enrich_kind:
                 if not HAS_PATENTSVIEW:
@@ -132,7 +163,7 @@ def _build_evidence_for_company(
                 pubnorms.append(build_pubnorm("US", num, kind))
                 pubnorms.append(build_pubnorm("US", num, None))
         except Exception as e:
-            typer.echo("Error querying USPTO Assignments.")
+            typer.echo("Error querying PatentsView.")
             typer.echo(str(e))
             if fallback_lens:
                 pubnorms = _collect_via_lens(aliases, limit)
@@ -147,7 +178,7 @@ def _build_evidence_for_company(
             base_set.add(f"{parts[0]}-{parts[1]}")
     pubnorms = sorted(base_set)
     if not pubnorms:
-        typer.echo("Could not build any pubnorms from assignment results.")
+        typer.echo("Could not build any pubnorms from PatentsView results.")
         return pd.DataFrame(), pd.DataFrame()
 
     typer.echo(f"Normalized to {len(pubnorms)} pubnorms. Starting DuckDB join.")
@@ -282,11 +313,11 @@ def run(
     wherefound: Optional[List[str]] = typer.Option(None, help="Filter citations by wherefound (repeatable)."),
     reftype: Optional[List[str]] = typer.Option(None, help="Filter citations by reftype (repeatable)."),
     enrich_kind: bool = typer.Option(True, help="Use PatentsView to fetch kind codes for pubnorms."),
-    assignment_source: str = typer.Option(
-        "uspto", help="Source for collecting starting patents: 'uspto' or 'lens'"
+    patent_source: str = typer.Option(
+        "patentsview", help="Source for collecting starting patents: 'patentsview' or 'lens'"
     ),
     fallback_lens: bool = typer.Option(
-        False, help="Fallback to Lens company search if USPTO assignments fail."
+        False, help="Fallback to Lens company search if PatentsView retrieval fails."
     ),
 ):
     # Build company list: include --company plus all names from file (if provided)
@@ -332,7 +363,7 @@ def run(
                     wherefound=wherefound,
                     reftype=reftype,
                     enrich_kind=enrich_kind,
-                    assignment_source=assignment_source,
+                    patent_source=patent_source,
                     fallback_lens=fallback_lens,
                 )
 
@@ -366,7 +397,7 @@ def run(
         wherefound=wherefound,
         reftype=reftype,
         enrich_kind=enrich_kind,
-        assignment_source=assignment_source,
+        patent_source=patent_source,
         fallback_lens=fallback_lens,
     )
 
