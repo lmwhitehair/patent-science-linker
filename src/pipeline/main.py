@@ -58,6 +58,7 @@ def _build_evidence_for_company(
     enrich_kind: bool,
     assignment_source: str,
     fallback_lens: bool,
+    local_match: str,
 ):
     typer.echo(f"Starting pipeline for: {company}")
 
@@ -73,6 +74,7 @@ def _build_evidence_for_company(
 
     # collect starting pubnorms
     pubnorms: list[str] = []
+    wipo_metadata: dict[str, dict[str, str]] = {}
 
     def _collect_via_lens(a_list: list[str], limit_val: Optional[int]) -> list[str]:
         typer.echo("Collecting starting set via Lens company search.")
@@ -105,8 +107,48 @@ def _build_evidence_for_company(
         typer.echo(f"Lens returned {len(out)} US pubnorms across aliases.")
         return out
 
-    if assignment_source.lower() == "lens":
+    local_match_mode = (local_match or "exact").lower()
+    if local_match_mode not in {"exact", "contains"}:
+        raise typer.BadParameter("local_match must be 'exact' or 'contains'.")
+
+    source = assignment_source.lower()
+    if source == "lens":
         pubnorms = _collect_via_lens(aliases, limit)
+    elif source in {"local", "patentsview"}:
+        if source == "patentsview":
+            typer.echo("[note] assignment_source 'patentsview' is deprecated; use 'local'.")
+        try:
+            typer.echo("Collecting starting set via local PatentsView data.")
+            from .patentsview_local import collect_pubnorms_from_local_patentsview
+
+            pv_dir_override = os.getenv("PATENTSVIEW_DATA_DIR")
+            pv_result = collect_pubnorms_from_local_patentsview(
+                aliases, limit=limit, data_dir=pv_dir_override, match=local_match_mode
+            )
+            pubnorms = pv_result.pubnorms
+            wipo_metadata = pv_result.metadata_by_pubnorm
+            typer.echo(
+                f"PatentsView matched {pv_result.matched_patent_count} unique patents "
+                f"-> {len(pubnorms)} pubnorm candidates."
+            )
+            if pv_result.missing_kind_count:
+                typer.echo(
+                    f"[note] {pv_result.missing_kind_count} patents missing wipo_kind; "
+                    "falling back to base pubnorm for those entries."
+                )
+            if not pubnorms and fallback_lens:
+                typer.echo("No PatentsView matches. Falling back to Lens company search.")
+                pubnorms = _collect_via_lens(aliases, limit)
+                wipo_metadata = {}
+        except Exception as exc:
+            typer.echo("Error querying local PatentsView data.")
+            typer.echo(str(exc))
+            if fallback_lens:
+                typer.echo("Falling back to Lens company search.")
+                pubnorms = _collect_via_lens(aliases, limit)
+                wipo_metadata = {}
+            else:
+                raise
     else:
         try:
             us_patents, us_apps = collect_numbers_for_parties(aliases)
@@ -172,6 +214,27 @@ def _build_evidence_for_company(
     # If no evidence rows, still emit one row per pubnorm with only patent populated
     if not rows:
         rows = [{"patent": p} for p in pubnorms]
+
+    def _wipo_for_patent(pat: Optional[str]) -> dict[str, str]:
+        if not wipo_metadata or not pat:
+            return {}
+        key = str(pat).lower()
+        meta = wipo_metadata.get(key)
+        if meta:
+            return meta
+        bits = key.split("-")
+        if len(bits) >= 2:
+            base_key = "-".join(bits[:2])
+            meta = wipo_metadata.get(base_key)
+            if meta:
+                return meta
+        return {}
+
+    for r in rows:
+        meta = _wipo_for_patent(r.get("patent"))
+        r["wipo_kind"] = meta.get("wipo_kind", "")
+        r["wipo_sector_title"] = meta.get("wipo_sector_title", "")
+        r["wipo_field_title"] = meta.get("wipo_field_title", "")
 
     def _norm_oaid(x):
         if x is None:
@@ -249,6 +312,9 @@ def _build_evidence_for_company(
 
     final_cols = [
         "patent",
+        "wipo_kind",
+        "wipo_sector_title",
+        "wipo_field_title",
         "paper_title",
         "publication_year",
         "abstract",
@@ -283,10 +349,13 @@ def run(
     reftype: Optional[List[str]] = typer.Option(None, help="Filter citations by reftype (repeatable)."),
     enrich_kind: bool = typer.Option(True, help="Use PatentsView to fetch kind codes for pubnorms."),
     assignment_source: str = typer.Option(
-        "uspto", help="Source for collecting starting patents: 'uspto' or 'lens'"
+        "local", help="Source for collecting starting patents: 'local', 'uspto', or 'lens'"
     ),
     fallback_lens: bool = typer.Option(
         False, help="Fallback to Lens company search if USPTO assignments fail."
+    ),
+    local_match: str = typer.Option(
+        "exact", help="Local PatentsView name match mode: 'exact' or 'contains'."
     ),
 ):
     # Build company list: include --company plus all names from file (if provided)
@@ -334,6 +403,7 @@ def run(
                     enrich_kind=enrich_kind,
                     assignment_source=assignment_source,
                     fallback_lens=fallback_lens,
+                    local_match=local_match,
                 )
 
                 sheet = _sanitize_sheet_name(comp)
@@ -355,7 +425,7 @@ def run(
 
     # Single-company mode
     comp = companies[0]
-    df_final, dfo = _build_evidence_for_company(
+    df_final, _ = _build_evidence_for_company(
         comp,
         confscore=confscore,
         aliases_file=aliases_file,
@@ -368,11 +438,11 @@ def run(
         enrich_kind=enrich_kind,
         assignment_source=assignment_source,
         fallback_lens=fallback_lens,
+        local_match=local_match,
     )
 
     company_slug = comp.lower().replace(" ", "_")
     evidence_xlsx = out / f"{company_slug}_evidence.xlsx"
-    oaids_path = out / f"{company_slug}_oaids.csv"
 
     with pd.ExcelWriter(evidence_xlsx, engine="xlsxwriter") as writer:
         df_final.to_excel(writer, index=False, sheet_name="evidence")
@@ -380,11 +450,7 @@ def run(
         fmt = writer.book.add_format({"text_wrap": False})
         ws.set_column(0, max(0, len(df_final.columns) - 1), None, fmt)
 
-    # OAIDs CSV only in single-company mode
-    dfo.to_csv(oaids_path, index=False)
-
     typer.echo(f"Wrote evidence: {evidence_xlsx}")
-    typer.echo(f"Wrote OAIDs:    {oaids_path}")
 
 
 if __name__ == "__main__":
