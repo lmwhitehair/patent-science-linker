@@ -7,6 +7,7 @@ from itertools import islice
 from typing import Dict, Iterable, List, Optional, Union
 
 import pyalex
+import requests
 from pyalex import Works, config
 
 # ---------------------------
@@ -31,6 +32,9 @@ config.retry_http_codes = [429, 500, 503]
 # OpenAlex hard limit is 100 IDs per request
 MAX_IDS_PER_CALL = int(os.getenv("OPENALEX_MAX_IDS_PER_CALL", "100"))
 BATCH_SLEEP = float(os.getenv("OPENALEX_BATCH_SLEEP", "0"))  # seconds between batches (optional throttle)
+OPENALEX_BASE_URL = os.getenv("OPENALEX_BASE_URL", "https://api.openalex.org").rstrip("/")
+OPENALEX_UNIVERSITY_MAX_WORKS = int(os.getenv("OPENALEX_UNIVERSITY_MAX_WORKS", "5000"))
+OPENALEX_UNIVERSITY_PAGE_SIZE = int(os.getenv("OPENALEX_UNIVERSITY_PAGE_SIZE", "200"))
 
 
 # ---------------------------
@@ -202,3 +206,116 @@ def fetch_works_by_ids(oaids: List[Union[str, int]], per_call: Optional[int] = N
             time.sleep(BATCH_SLEEP)
 
     return by_id
+
+
+def _normalize_institution_id(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    lower = value.lower()
+    if lower.startswith("https://openalex.org/"):
+        value = value.rsplit("/", 1)[-1]
+    value = value.upper()
+    if value.startswith("I"):
+        return value
+    return None
+
+
+def _lookup_institution_id_by_name(name: str) -> Optional[str]:
+    """
+    Resolve a display name to an OpenAlex institution id (Ixxxx).
+    """
+    params = {"search": name, "per-page": 1}
+    if email:
+        params["mailto"] = email
+    if api_key:
+        params["api_key"] = api_key
+
+    url = f"{OPENALEX_BASE_URL}/institutions"
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    results = resp.json().get("results") or []
+    if not results:
+        return None
+    raw = results[0].get("id") or ((results[0].get("ids") or {}).get("openalex"))
+    return _normalize_institution_id(raw)
+
+
+def _build_institution_filter(raw: str) -> str:
+    """
+    Build an OpenAlex filter string for institution lookups.
+    Accepts:
+      - OpenAlex institution IDs (I12345...)
+      - Full OpenAlex URLs
+      - ROR URLs
+      - Fallback: display_name search (best-effort via /institutions search)
+    """
+    value = (raw or "").strip()
+    if not value:
+        raise ValueError("Institution name/id is required.")
+    lower = value.lower()
+    inst_id = _normalize_institution_id(value)
+    if inst_id:
+        return f"institutions.id:{inst_id}"
+    if lower.startswith("https://ror.org/"):
+        return f"institutions.ror:{value}"
+    inst_id = _lookup_institution_id_by_name(value)
+    if inst_id:
+        return f"institutions.id:{inst_id}"
+    # Last resort: fall back to display_name search
+    return f'institutions.display_name.search:"{value}"'
+
+
+def fetch_institution_oaids(
+    institution: str,
+    *,
+    max_works: Optional[int] = None,
+    per_page: Optional[int] = None,
+) -> List[str]:
+    """
+    Fetch OpenAlex work IDs (OAIDs) for a given institution/university.
+
+    Returns a list of normalized OAIDs (W-prefixed strings), limited by max_works.
+    """
+    cap = max_works if max_works is not None else OPENALEX_UNIVERSITY_MAX_WORKS
+    per_page = per_page or OPENALEX_UNIVERSITY_PAGE_SIZE
+    per_page = max(1, min(per_page, 200))
+
+    filter_str = _build_institution_filter(institution)
+    params = {
+        "filter": filter_str,
+        "per-page": per_page,
+        "cursor": "*",
+        "select": "id",
+    }
+    if email:
+        params["mailto"] = email
+    if api_key:
+        params["api_key"] = api_key
+
+    url = f"{OPENALEX_BASE_URL}/works"
+    collected: List[str] = []
+    cursor = "*"
+    session = requests.Session()
+
+    while cursor and (cap is None or len(collected) < cap):
+        params["cursor"] = cursor
+        resp = session.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        results = payload.get("results") or []
+        for item in results:
+            wid = normalize_oaid(item.get("id"))
+            if wid:
+                collected.append(wid)
+                if cap is not None and len(collected) >= cap:
+                    break
+        if cap is not None and len(collected) >= cap:
+            break
+        cursor = (payload.get("meta") or {}).get("next_cursor")
+        if not cursor or cursor in {"", "null"} or not results:
+            break
+
+    return collected

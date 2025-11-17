@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from .company_query import seed_aliases
 from .normalizer import build_pubnorm, normalize_doc_number, from_lens_publication_reference
 from .uspto_assignment_client import collect_numbers_for_parties_ac as collect_numbers_for_parties
-from .openalex_client import fetch_works_by_ids
+from .openalex_client import fetch_works_by_ids, fetch_institution_oaids
 from .lens_client import fetch_company_patents
 
 # optional enrichment
@@ -22,6 +22,8 @@ try:
     HAS_PATENTSVIEW = True
 except Exception:
     HAS_PATENTSVIEW = False
+
+from .patentsview_local import collect_pubnorms_from_local_patentsview, fetch_metadata_for_patent_ids
 
 
 app = typer.Typer(add_completion=False)
@@ -42,6 +44,38 @@ def _sanitize_sheet_name(name: str) -> str:
     if not cleaned:
         cleaned = "Sheet"
     return cleaned
+
+
+def _slugify(value: str) -> str:
+    """
+    Build a filesystem-friendly slug (lowercase, underscores).
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return slug or "output"
+
+
+def _normalize_oaid_str(x: Optional[str]) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    return s if s.upper().startswith("W") else f"W{s}"
+
+
+def _pubnorm_to_patent_id(patent: Optional[str]) -> Optional[str]:
+    if not patent:
+        return None
+    s = str(patent).strip().lower()
+    if not s.startswith("us-"):
+        return None
+    bits = s.split("-")
+    if len(bits) < 2:
+        return None
+    body = bits[1]
+    body = body.split("/")[0]
+    digits = re.sub(r"[^0-9]", "", body)
+    return digits or None
 
 
 def _build_evidence_for_company(
@@ -119,8 +153,6 @@ def _build_evidence_for_company(
             typer.echo("[note] assignment_source 'patentsview' is deprecated; use 'local'.")
         try:
             typer.echo("Collecting starting set via local PatentsView data.")
-            from .patentsview_local import collect_pubnorms_from_local_patentsview
-
             pv_dir_override = os.getenv("PATENTSVIEW_DATA_DIR")
             pv_result = collect_pubnorms_from_local_patentsview(
                 aliases, limit=limit, data_dir=pv_dir_override, match=local_match_mode
@@ -236,13 +268,7 @@ def _build_evidence_for_company(
         r["wipo_sector_title"] = meta.get("wipo_sector_title", "")
         r["wipo_field_title"] = meta.get("wipo_field_title", "")
 
-    def _norm_oaid(x):
-        if x is None:
-            return None
-        s = str(x)
-        return s if s.startswith("W") else f"W{s}"
-
-    oaids = sorted({_norm_oaid(r.get("oaid")) for r in rows if r.get("oaid")})
+    oaids = sorted({_normalize_oaid_str(r.get("oaid")) for r in rows if r.get("oaid")})
     oaids = [x for x in oaids if x]
 
     works_by_id: dict[str, dict] = {}
@@ -260,7 +286,7 @@ def _build_evidence_for_company(
         return "; ".join(sorted({p for p in parts if p}))
 
     for r in rows:
-        wid = _norm_oaid(r.get("oaid"))
+        wid = _normalize_oaid_str(r.get("oaid"))
         w = works_by_id.get(wid or "", {})
 
         if not w:
@@ -326,19 +352,144 @@ def _build_evidence_for_company(
     final_rows = [{k: r.get(k, "") for k in final_cols} for r in rows]
     df_final = pd.DataFrame(final_rows, columns=final_cols)
 
-    # Optional: blocker for empties (helps in xlsx to stop visual spill)
-    BLOCKER = "\u2060"
-    for col in ["grants", "award_ids", "institutions", "funder"]:
-        if col in df_final.columns:
-            df_final[col] = df_final[col].replace({"": BLOCKER})
-
     return df_final, dfo
+
+
+def _build_university_patent_view(
+    university: str,
+    *,
+    confscore: int,
+    limit: Optional[int],
+    pcs_path: Optional[str],
+    pcs_format: Optional[str],
+    wherefound: Optional[List[str]],
+    reftype: Optional[List[str]],
+) -> pd.DataFrame:
+    typer.echo(f"Starting university pipeline for: {university}")
+    max_works = limit if limit is not None else None
+    oaids = fetch_institution_oaids(university, max_works=max_works)
+    if not oaids:
+        typer.echo("No OpenAlex works returned for this institution.")
+        return pd.DataFrame()
+    typer.echo(f"Collected {len(oaids)} works for institution (limit={max_works or 'env default'}). Checking PCS joins.")
+
+    # LAZY IMPORT to keep startup light
+    from .duck import get_patents_for_oaids
+
+    df = get_patents_for_oaids(
+        oaids=oaids,
+        confscore_min=confscore,
+        wherefound=wherefound,
+        reftype=reftype,
+        pcs_path=pcs_path,
+        pcs_format=pcs_format,
+    )
+
+    if df.empty:
+        typer.echo("No patents referencing those works were found in PCS.")
+        return pd.DataFrame()
+
+    target_oaids = sorted({_normalize_oaid_str(x) for x in df["oaid"].tolist() if x})
+    typer.echo(f"Matched {len(target_oaids)} OAIDs in PCS. Enriching metadata from OpenAlex.")
+    works = fetch_works_by_ids(target_oaids) if target_oaids else {}
+    typer.echo("Enriching PatentsView metadata for assignees + WIPO fields.")
+
+    patent_key_to_id: dict[str, str] = {}
+    patent_ids: list[str] = []
+    for pat in df["patent"].tolist():
+        key = str(pat).strip().lower()
+        pid = _pubnorm_to_patent_id(pat)
+        if not pid:
+            continue
+        if key and key not in patent_key_to_id:
+            patent_key_to_id[key] = pid
+        base_bits = key.split("-")
+        if len(base_bits) >= 2:
+            base_key = "-".join(base_bits[:2])
+            if base_key not in patent_key_to_id:
+                patent_key_to_id[base_key] = pid
+        patent_ids.append(pid)
+
+    pv_metadata: dict[str, dict[str, str]] = {}
+    unique_patent_ids = list(dict.fromkeys(patent_ids))
+    if unique_patent_ids:
+        try:
+            pv_metadata = fetch_metadata_for_patent_ids(unique_patent_ids)
+        except Exception as exc:
+            typer.echo(f"[warn] PatentsView metadata unavailable: {exc}")
+            pv_metadata = {}
+
+    rows = []
+    def join_unique(parts):
+        return "; ".join(sorted({p for p in parts if p}))
+
+    for record in df.to_dict(orient="records"):
+        wid = _normalize_oaid_str(record.get("oaid"))
+        w = works.get(wid or "", {})
+
+        patent_key = str(record.get("patent") or "").strip().lower()
+        base_key = "-".join(patent_key.split("-")[:2]) if patent_key else ""
+        patent_id = patent_key_to_id.get(patent_key) or patent_key_to_id.get(base_key or "")
+        meta = pv_metadata.get(patent_id or "", {})
+
+        grant_bits = []
+        for g in (w.get("grants") or []):
+            fname = g.get("funder_display_name") or g.get("funder") or ""
+            award = g.get("award_id") or ""
+            if fname and award:
+                grant_bits.append(f"{fname}:{award}")
+            elif fname or award:
+                grant_bits.append(fname or award)
+
+        rows.append(
+            {
+                "university": university,
+                "oaid": wid or "",
+                "paper_title": (w.get("title") or w.get("display_name") or "").strip(),
+                "publication_year": w.get("publication_year") or "",
+                "grants": join_unique(grant_bits),
+                "award_ids": join_unique(w.get("_grants_award_ids") or []),
+                "institutions": "; ".join(w.get("_institutions_list") or []),
+                "topics": "; ".join(w.get("_topics_list") or []),
+                "patent": record.get("patent") or "",
+                "wipo_kind": meta.get("wipo_kind", ""),
+                "wipo_sector_title": meta.get("wipo_sector_title", ""),
+                "wipo_field_title": meta.get("wipo_field_title", ""),
+                "wherefound": record.get("wherefound") or "",
+                "reftype": record.get("reftype") or "",
+                "confscore": record.get("confscore") or "",
+                "assignees": meta.get("assignees", ""),
+            }
+        )
+
+    columns = [
+        "university",
+        "oaid",
+        "paper_title",
+        "publication_year",
+        "grants",
+        "award_ids",
+        "institutions",
+        "topics",
+        "patent",
+        "wipo_kind",
+        "wipo_sector_title",
+        "wipo_field_title",
+        "wherefound",
+        "reftype",
+        "confscore",
+        "assignees",
+    ]
+    return pd.DataFrame(rows, columns=columns)
 
 
 @app.command()
 def run(
     company: Optional[str] = typer.Option(None, help="Company/assignee/owner name (exact-match variants generated)."),
     from_query: Optional[str] = typer.Option(None, help="Path to .txt file with one company per line."),
+    from_university: Optional[str] = typer.Option(
+        None, help="OpenAlex institution id/name. Enables university-driven mode."
+    ),
     confscore: int = typer.Option(8, help="Minimum confscore to accept a citation match."),
     aliases_file: str | None = typer.Option(None, help="Extra aliases (one per line; '#' comments allowed)."),
     include_predecessors: bool = typer.Option(False, help="Include known predecessor names (mergers/legacy)."),
@@ -358,6 +509,29 @@ def run(
         "exact", help="Local PatentsView name match mode: 'exact' or 'contains'."
     ),
 ):
+    out = outdir()
+
+    if from_university:
+        if company or from_query:
+            raise typer.BadParameter("--from-university cannot be combined with --company/--from_query.")
+        df_university = _build_university_patent_view(
+            from_university,
+            confscore=confscore,
+            limit=limit,
+            pcs_path=pcs_path,
+            pcs_format=pcs_format,
+            wherefound=wherefound,
+            reftype=reftype,
+        )
+        if df_university.empty:
+            typer.echo("No results found for this institution.")
+            return
+        uni_slug = _slugify(from_university)
+        csv_path = out / f"{uni_slug}_university_patents.csv"
+        df_university.to_csv(csv_path, index=False)
+        typer.echo(f"Wrote university report: {csv_path}")
+        return
+
     # Build company list: include --company plus all names from file (if provided)
     companies: list[str] = []
     if company:
@@ -377,8 +551,6 @@ def run(
 
     if not companies:
         raise typer.BadParameter("Provide --company and/or --from_query with at least one name.")
-
-    out = outdir()
 
     # If a query file is used, write a single combined workbook named after the file stem
     if from_query:
@@ -441,7 +613,7 @@ def run(
         local_match=local_match,
     )
 
-    company_slug = comp.lower().replace(" ", "_")
+    company_slug = _slugify(comp)
     evidence_xlsx = out / f"{company_slug}_evidence.xlsx"
 
     with pd.ExcelWriter(evidence_xlsx, engine="xlsxwriter") as writer:

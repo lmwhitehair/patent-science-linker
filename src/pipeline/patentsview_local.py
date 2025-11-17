@@ -142,6 +142,51 @@ def _fetch_wipo_taxonomy(
     return df
 
 
+def _fetch_assignees(
+    con: duckdb.DuckDBPyConnection,
+    assignee_path: Path,
+    patent_ids: Sequence[str],
+) -> pd.DataFrame:
+    if not patent_ids:
+        return pd.DataFrame(columns=["patent_id", "assignees"])
+
+    df_patents = pd.DataFrame({"patent_id": patent_ids})
+    con.register("target_patents", df_patents)
+    sql = """
+        SELECT
+            t.patent_id,
+            string_agg(
+                DISTINCT NULLIF(
+                    COALESCE(
+                        NULLIF(trim(a.disambig_assignee_organization), ''),
+                        NULLIF(
+                            trim(
+                                trim(COALESCE(a.disambig_assignee_individual_name_first, '')) || ' ' ||
+                                trim(COALESCE(a.disambig_assignee_individual_name_last, ''))
+                            ),
+                            ''
+                        )
+                    ),
+                    ''
+                ),
+                '; '
+            ) AS assignees
+        FROM target_patents AS t
+        LEFT JOIN read_csv_auto(?, delim='\t', header=TRUE, quote='"', sample_size=-1,
+                                types={
+                                    'patent_id':'VARCHAR',
+                                    'disambig_assignee_organization':'VARCHAR',
+                                    'disambig_assignee_individual_name_first':'VARCHAR',
+                                    'disambig_assignee_individual_name_last':'VARCHAR'
+                                }) AS a
+          ON a.patent_id = t.patent_id
+        GROUP BY t.patent_id
+    """
+    df = con.execute(sql, [assignee_path.as_posix()]).fetchdf()
+    con.unregister("target_patents")
+    return df
+
+
 def collect_pubnorms_from_local_patentsview(
     aliases: Sequence[str],
     *,
@@ -243,5 +288,64 @@ def collect_pubnorms_from_local_patentsview(
                 seen_pubnorms.add(key)
 
         return PatentsViewLocalResult(pubnorms, metadata, len(df), missing_kind)
+    finally:
+        con.close()
+
+
+def fetch_metadata_for_patent_ids(
+    patent_ids: Sequence[str],
+    *,
+    data_dir: Optional[str | os.PathLike[str]] = None,
+) -> Dict[str, Dict[str, str]]:
+    """
+    Fetch wipo kind/sector/field and assignee names for provided patent_ids.
+    """
+    unique_ids = [pid for pid in dict.fromkeys(str(p).strip() for p in patent_ids if p)]
+    if not unique_ids:
+        return {}
+
+    pv_dir = _resolve_data_dir(data_dir)
+    assignee_path = pv_dir / "g_assignee_disambiguated.tsv"
+    patent_path = pv_dir / "g_patent.tsv"
+    wipo_path = pv_dir / "g_wipo_technology.tsv"
+
+    _require_file(assignee_path)
+    _require_file(patent_path)
+    _require_file(wipo_path)
+
+    con = duckdb.connect()
+    try:
+        df = pd.DataFrame({"patent_id": unique_ids})
+        df_kinds = _fetch_wipo_kinds(con, patent_path, unique_ids)
+        df_wipo = _fetch_wipo_taxonomy(con, wipo_path, unique_ids)
+        df_assignees = _fetch_assignees(con, assignee_path, unique_ids)
+
+        if not df_kinds.empty:
+            df = df.merge(df_kinds, on="patent_id", how="left")
+        else:
+            df["wipo_kind"] = ""
+
+        if not df_wipo.empty:
+            df = df.merge(df_wipo, on="patent_id", how="left")
+        else:
+            df["wipo_sector_title"] = ""
+            df["wipo_field_title"] = ""
+
+        if not df_assignees.empty:
+            df = df.merge(df_assignees, on="patent_id", how="left")
+        else:
+            df["assignees"] = ""
+
+        df = df.fillna("")
+        out: Dict[str, Dict[str, str]] = {}
+        for row in df.itertuples(index=False):
+            pid = str(row.patent_id).strip()
+            out[pid] = {
+                "wipo_kind": getattr(row, "wipo_kind", ""),
+                "wipo_sector_title": getattr(row, "wipo_sector_title", ""),
+                "wipo_field_title": getattr(row, "wipo_field_title", ""),
+                "assignees": getattr(row, "assignees", ""),
+            }
+        return out
     finally:
         con.close()
