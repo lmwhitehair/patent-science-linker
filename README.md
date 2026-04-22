@@ -146,10 +146,8 @@ By default, outputs are written under `data/outputs/` (which is ignored by git):
 
 ## Common pitfalls
 
-- If you see missing results, check that your company/assignee string matches how it appears in Lens.
+- If you see missing results, check that your company/assignee string matches how it appears in Lens/PatentsView.
 - If outputs aren’t appearing, confirm you have required env vars set and that `data/outputs/` exists (the pipeline will create it in most cases).
 
-## License
 
-Add a LICENSE before making the repository public (e.g., MIT or Apache-2.0), depending on how you want others to reuse the code.
 
