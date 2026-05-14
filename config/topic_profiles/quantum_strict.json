@@ -1,0 +1,33 @@
+{
+  "name": "quantum_strict",
+  "include_terms_title": [
+    "qubit",
+    "quantum computing",
+    "quantum computer",
+    "quantum algorithm",
+    "quantum error correction",
+    "quantum key distribution",
+    "quantum communication",
+    "quantum anneal"
+  ],
+  "include_terms_abstract": [
+    "qubit",
+    "quantum computing",
+    "quantum circuit",
+    "quantum processor",
+    "quantum key distribution"
+  ],
+  "exclude_terms_title": [
+    "quantum dot",
+    "quantum well"
+  ],
+  "exclude_terms_abstract": [
+    "quantum dot",
+    "quantum well"
+  ],
+  "cpc_include_prefixes": [
+    "G06N10",
+    "H04L9/0852",
+    "H04L9/0858"
+  ]
+}

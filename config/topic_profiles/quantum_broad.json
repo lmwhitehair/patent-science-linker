@@ -1,0 +1,45 @@
+{
+  "name": "quantum_broad",
+  "include_terms_title": [
+    "quantum",
+    "qubit",
+    "quantum computing",
+    "quantum communication",
+    "quantum key",
+    "quantum sensor",
+    "quantum anneal",
+    "photonics",
+    "josephson junction",
+    "quantum computer",
+    "optics",
+    "cryogenics",
+    "cryogenic"
+  ],
+  "include_terms_abstract": [
+    "quantum",
+    "qubit",
+    "quantum circuit",
+    "quantum processor",
+    "superposition",
+    "quantum key",
+    "quantum sensor",
+    "quantum anneal",
+    "photonics",
+    "josephson junction",
+    "quantum computer",
+    "optics",
+    "cryogenics",
+    "cryogenic"
+  ],
+  "exclude_terms_title": [
+    "quantum dot display"
+  ],
+  "exclude_terms_abstract": [
+    "quantum dot display"
+  ],
+  "cpc_include_prefixes": [
+    "G06N10",
+    "H04L9/0852",
+    "H04L9/0858"
+  ]
+}

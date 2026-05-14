@@ -15,6 +15,7 @@ Thumbs.db
 # Data & outputs
 data/
 outputs/
+analysis/
 artifacts/
 logs/
 *.csv

@@ -85,7 +85,7 @@ def _select_fields() -> List[str]:
         "authorships",
         "concepts",
         "topics",
-        "grants",
+        "awards",                   # OpenAlex replaced/valid field vs legacy grants
         "funders",
         "primary_location",
         "referenced_works",
@@ -182,16 +182,34 @@ def fetch_works_by_ids(oaids: List[Union[str, int]], per_call: Optional[int] = N
             else:
                 tset = {c.get("display_name") for c in (w.get("concepts") or []) if c.get("display_name")}
 
-            # Funders from grants; fallback to funders list
+            # Funders/award IDs from awards (preferred) with backward-compatible grants fallback
             award_ids = []
             funders = set()
+
+            # Newer OpenAlex field
+            for g in (w.get("awards") or []):
+                award = g.get("award_id") or g.get("id")
+                if award:
+                    award_ids.append(str(award))
+                fname = g.get("funder_display_name") or g.get("funder") or g.get("funder_name")
+                if fname:
+                    funders.add(str(fname))
+
+            # Backward compatibility if API/library still returns grants
             for g in (w.get("grants") or []):
                 award = g.get("award_id")
                 if award:
-                    award_ids.append(award)
+                    award_ids.append(str(award))
                 fname = g.get("funder_display_name") or g.get("funder")
                 if fname:
-                    funders.add(fname)
+                    funders.add(str(fname))
+
+            # Supplement from top-level funders list
+            for f in (w.get("funders") or []):
+                if isinstance(f, dict):
+                    fname = f.get("display_name") or f.get("name")
+                    if fname:
+                        funders.add(str(fname))
 
             w["_authors_list"] = authors
             w["_institutions_list"] = sorted(insts_set)

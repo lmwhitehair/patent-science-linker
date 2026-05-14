@@ -32,6 +32,19 @@ def _resolve_data_dir(data_dir: Optional[str | os.PathLike[str]]) -> Path:
     return candidate
 
 
+def _resolve_data_file(data_dir: Path, base_name: str) -> Path:
+    """
+    Resolve a PatentsView file path, preferring unzipped TSV and falling back to .zip.
+    """
+    plain = data_dir / base_name
+    zipped = data_dir / f"{base_name}.zip"
+    if plain.exists():
+        return plain
+    if zipped.exists():
+        return zipped
+    raise FileNotFoundError(f"Required PatentsView file not found: {plain} or {zipped}")
+
+
 def _require_file(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Required PatentsView file not found: {path}")
@@ -142,6 +155,47 @@ def _fetch_wipo_taxonomy(
     return df
 
 
+def _fetch_patent_text_and_cpc(
+    con: duckdb.DuckDBPyConnection,
+    patent_path: Path,
+    abstract_path: Path,
+    cpc_path: Path,
+    patent_ids: Sequence[str],
+) -> pd.DataFrame:
+    if not patent_ids:
+        return pd.DataFrame(
+            columns=["patent_id", "patent_title", "patent_abstract", "cpc_groups", "cpc_prefixes"]
+        )
+
+    df_patents = pd.DataFrame({"patent_id": patent_ids})
+    con.register("target_patents", df_patents)
+    sql = """
+        SELECT
+            t.patent_id,
+            COALESCE(p.patent_title, '') AS patent_title,
+            COALESCE(a.patent_abstract, '') AS patent_abstract,
+            COALESCE(string_agg(DISTINCT NULLIF(trim(c.cpc_group), ''), '; '), '') AS cpc_groups,
+            COALESCE(string_agg(DISTINCT NULLIF(split_part(trim(c.cpc_group), '/', 1), ''), '; '), '') AS cpc_prefixes
+        FROM target_patents AS t
+        LEFT JOIN read_csv_auto(?, delim='\t', header=TRUE, quote='"', sample_size=-1,
+                                types={'patent_id':'VARCHAR', 'patent_title':'VARCHAR'}) AS p
+          ON p.patent_id = t.patent_id
+        LEFT JOIN read_csv_auto(?, delim='\t', header=TRUE, quote='"', sample_size=-1,
+                                types={'patent_id':'VARCHAR', 'patent_abstract':'VARCHAR'}) AS a
+          ON a.patent_id = t.patent_id
+        LEFT JOIN read_csv_auto(?, delim='\t', header=TRUE, quote='"', sample_size=-1,
+                                types={'patent_id':'VARCHAR', 'cpc_group':'VARCHAR'}) AS c
+          ON c.patent_id = t.patent_id
+        GROUP BY t.patent_id, p.patent_title, a.patent_abstract
+    """
+    df = con.execute(
+        sql,
+        [patent_path.as_posix(), abstract_path.as_posix(), cpc_path.as_posix()],
+    ).fetchdf()
+    con.unregister("target_patents")
+    return df
+
+
 def _fetch_assignees(
     con: duckdb.DuckDBPyConnection,
     assignee_path: Path,
@@ -218,13 +272,17 @@ def collect_pubnorms_from_local_patentsview(
         raise ValueError("match must be 'exact' or 'contains'")
 
     pv_dir = _resolve_data_dir(data_dir)
-    assignee_path = pv_dir / "g_assignee_disambiguated.tsv"
-    patent_path = pv_dir / "g_patent.tsv"
-    wipo_path = pv_dir / "g_wipo_technology.tsv"
+    assignee_path = _resolve_data_file(pv_dir, "g_assignee_disambiguated.tsv")
+    patent_path = _resolve_data_file(pv_dir, "g_patent.tsv")
+    wipo_path = _resolve_data_file(pv_dir, "g_wipo_technology.tsv")
+    abstract_path = _resolve_data_file(pv_dir, "g_patent_abstract.tsv")
+    cpc_path = _resolve_data_file(pv_dir, "g_cpc_current.tsv")
 
     _require_file(assignee_path)
     _require_file(patent_path)
     _require_file(wipo_path)
+    _require_file(abstract_path)
+    _require_file(cpc_path)
 
     con = duckdb.connect()
     try:
@@ -237,6 +295,7 @@ def collect_pubnorms_from_local_patentsview(
 
         df_kinds = _fetch_wipo_kinds(con, patent_path, patent_ids)
         df_wipo = _fetch_wipo_taxonomy(con, wipo_path, patent_ids)
+        df_text = _fetch_patent_text_and_cpc(con, patent_path, abstract_path, cpc_path, patent_ids)
 
         df = pd.DataFrame({"patent_id": patent_ids})
         if not df_kinds.empty:
@@ -250,9 +309,21 @@ def collect_pubnorms_from_local_patentsview(
             df["wipo_sector_title"] = ""
             df["wipo_field_title"] = ""
 
+        if not df_text.empty:
+            df = df.merge(df_text, on="patent_id", how="left")
+        else:
+            df["patent_title"] = ""
+            df["patent_abstract"] = ""
+            df["cpc_groups"] = ""
+            df["cpc_prefixes"] = ""
+
         df["wipo_kind"] = df["wipo_kind"].fillna("").astype(str).str.strip().str.upper()
         df["wipo_sector_title"] = df["wipo_sector_title"].fillna("").astype(str).str.strip()
         df["wipo_field_title"] = df["wipo_field_title"].fillna("").astype(str).str.strip()
+        df["patent_title"] = df["patent_title"].fillna("").astype(str).str.strip()
+        df["patent_abstract"] = df["patent_abstract"].fillna("").astype(str).str.strip()
+        df["cpc_groups"] = df["cpc_groups"].fillna("").astype(str).str.strip()
+        df["cpc_prefixes"] = df["cpc_prefixes"].fillna("").astype(str).str.strip()
 
         pubnorms: List[str] = []
         metadata: Dict[str, Dict[str, str]] = {}
@@ -266,6 +337,10 @@ def collect_pubnorms_from_local_patentsview(
             kind = getattr(row, "wipo_kind", "") or ""
             sector = getattr(row, "wipo_sector_title", "") or ""
             field = getattr(row, "wipo_field_title", "") or ""
+            title = getattr(row, "patent_title", "") or ""
+            abstract = getattr(row, "patent_abstract", "") or ""
+            cpc_groups = getattr(row, "cpc_groups", "") or ""
+            cpc_prefixes = getattr(row, "cpc_prefixes", "") or ""
 
             base_key = build_pubnorm("US", patent_id, None).lower()
             payload = {
@@ -273,6 +348,10 @@ def collect_pubnorms_from_local_patentsview(
                 "wipo_kind": kind,
                 "wipo_sector_title": sector,
                 "wipo_field_title": field,
+                "patent_title": title,
+                "patent_abstract": abstract,
+                "cpc_groups": cpc_groups,
+                "cpc_prefixes": cpc_prefixes,
             }
             metadata[base_key] = payload
 
@@ -305,13 +384,17 @@ def fetch_metadata_for_patent_ids(
         return {}
 
     pv_dir = _resolve_data_dir(data_dir)
-    assignee_path = pv_dir / "g_assignee_disambiguated.tsv"
-    patent_path = pv_dir / "g_patent.tsv"
-    wipo_path = pv_dir / "g_wipo_technology.tsv"
+    assignee_path = _resolve_data_file(pv_dir, "g_assignee_disambiguated.tsv")
+    patent_path = _resolve_data_file(pv_dir, "g_patent.tsv")
+    wipo_path = _resolve_data_file(pv_dir, "g_wipo_technology.tsv")
+    abstract_path = _resolve_data_file(pv_dir, "g_patent_abstract.tsv")
+    cpc_path = _resolve_data_file(pv_dir, "g_cpc_current.tsv")
 
     _require_file(assignee_path)
     _require_file(patent_path)
     _require_file(wipo_path)
+    _require_file(abstract_path)
+    _require_file(cpc_path)
 
     con = duckdb.connect()
     try:
@@ -319,6 +402,7 @@ def fetch_metadata_for_patent_ids(
         df_kinds = _fetch_wipo_kinds(con, patent_path, unique_ids)
         df_wipo = _fetch_wipo_taxonomy(con, wipo_path, unique_ids)
         df_assignees = _fetch_assignees(con, assignee_path, unique_ids)
+        df_text = _fetch_patent_text_and_cpc(con, patent_path, abstract_path, cpc_path, unique_ids)
 
         if not df_kinds.empty:
             df = df.merge(df_kinds, on="patent_id", how="left")
@@ -336,6 +420,14 @@ def fetch_metadata_for_patent_ids(
         else:
             df["assignees"] = ""
 
+        if not df_text.empty:
+            df = df.merge(df_text, on="patent_id", how="left")
+        else:
+            df["patent_title"] = ""
+            df["patent_abstract"] = ""
+            df["cpc_groups"] = ""
+            df["cpc_prefixes"] = ""
+
         df = df.fillna("")
         out: Dict[str, Dict[str, str]] = {}
         for row in df.itertuples(index=False):
@@ -345,6 +437,10 @@ def fetch_metadata_for_patent_ids(
                 "wipo_sector_title": getattr(row, "wipo_sector_title", ""),
                 "wipo_field_title": getattr(row, "wipo_field_title", ""),
                 "assignees": getattr(row, "assignees", ""),
+                "patent_title": getattr(row, "patent_title", ""),
+                "patent_abstract": getattr(row, "patent_abstract", ""),
+                "cpc_groups": getattr(row, "cpc_groups", ""),
+                "cpc_prefixes": getattr(row, "cpc_prefixes", ""),
             }
         return out
     finally:

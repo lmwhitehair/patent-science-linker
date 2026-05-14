@@ -69,6 +69,19 @@ Example run:
 python -m src.pipeline.main --company "Company X" --confscore 8 --limit 5000
 ```
 
+Topic-gated quantum example:
+
+```bash
+python -m src.pipeline.main \
+  --from-query Queries/quantum_companies_query.txt \
+  --assignment-source local \
+  --local-match exact \
+  --pcs-path pcs_oa.parquet \
+  --pcs-format parquet \
+  --topic-profile config/topic_profiles/quantum_strict.json
+```
+
+
 ## Execution parameters (what changes pipeline behavior)
 
 The CLI exposes a few parameters that materially change behavior:
@@ -113,6 +126,13 @@ The CLI exposes a few parameters that materially change behavior:
 - `--fallback-lens`
   - If `assignment_source=uspto` or `local` fails to return patents, fall back to Lens company search.
 
+- `--topic-profile /path/to/profile.json`
+  - Apply a **rule-based topic filter** to patents **before PCS join**.
+  - The profile supports title/abstract keyword include/exclude and CPC prefix includes.
+
+- `--topic-audit / --no-topic-audit`
+  - When topic filtering is enabled, write an audit sheet showing per-patent pass/fail rationale.
+
 ### PCS evidence input
 - `--pcs-path /path/to/pcs_oa.(csv|parquet)`
   - Override PCS evidence location (otherwise uses env `PCS_PATH`).
@@ -137,12 +157,15 @@ By default, outputs are written under `data/outputs/` (which is ignored by git):
 - `<company>_evidence.xlsx`
   - `evidence`: enriched evidence table (e.g., patent, paper_title, publication_year, abstract, grants, award_ids, institutions, topics)
   - `evidence_raw`: raw PCS evidence (e.g., patent, oaid, confscore, reftype, wherefound)
+  - `topic_audit` (when `--topic-profile` and `--topic-audit`): pass/fail rationale per patent with matched include/exclude/CPC rules
 
 ## Notes / implementation details
 
 - Patent identifiers are expected in a normalized form like `us-11426570-b2` or `wo-2022020260-a1`.
 - The Lens client supports both offset pagination and scroll/cursor pagination for large result sets.
 - `--resolved-only` biases toward patents with resolved NPL (more likely to map cleanly to OAIDs).
+- Local PatentsView loading supports both unzipped `*.tsv` and zipped `*.tsv.zip` files in `PATENTSVIEW_DATA_DIR` (or `data/patentsview` by default).
+- Topic profiles live under `config/topic_profiles/` (e.g., `quantum_strict.json`, `quantum_broad.json`).
 
 ## Common pitfalls
 

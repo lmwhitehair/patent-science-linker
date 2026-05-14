@@ -24,6 +24,7 @@ except Exception:
     HAS_PATENTSVIEW = False
 
 from .patentsview_local import collect_pubnorms_from_local_patentsview, fetch_metadata_for_patent_ids
+from .topic_filter import apply_topic_filter, load_topic_profile
 
 
 app = typer.Typer(add_completion=False)
@@ -93,6 +94,7 @@ def _build_evidence_for_company(
     assignment_source: str,
     fallback_lens: bool,
     local_match: str,
+    topic_profile: Optional[str] = None,
 ):
     typer.echo(f"Starting pipeline for: {company}")
 
@@ -109,6 +111,7 @@ def _build_evidence_for_company(
     # collect starting pubnorms
     pubnorms: list[str] = []
     wipo_metadata: dict[str, dict[str, str]] = {}
+    audit_rows: list[dict] = []
 
     def _collect_via_lens(a_list: list[str], limit_val: Optional[int]) -> list[str]:
         typer.echo("Collecting starting set via Lens company search.")
@@ -220,9 +223,56 @@ def _build_evidence_for_company(
         if len(parts) >= 3:
             base_set.add(f"{parts[0]}-{parts[1]}")
     pubnorms = sorted(base_set)
+
+    if topic_profile:
+        # Ensure topic gating has metadata even when assignment source is USPTO/Lens.
+        # Local source already returns metadata_by_pubnorm, but other sources need hydration
+        # from local PatentsView files using patent IDs extracted from pubnorms.
+        patent_ids_for_topic: list[str] = []
+        pubnorm_to_patent_id: dict[str, str] = {}
+        for pat in pubnorms:
+            pid = _pubnorm_to_patent_id(pat)
+            if not pid:
+                continue
+            patent_ids_for_topic.append(pid)
+            pubnorm_to_patent_id[str(pat).lower()] = pid
+
+        if patent_ids_for_topic:
+            try:
+                pv_dir_override = os.getenv("PATENTSVIEW_DATA_DIR")
+                pv_metadata = fetch_metadata_for_patent_ids(
+                    list(dict.fromkeys(patent_ids_for_topic)),
+                    data_dir=pv_dir_override,
+                )
+                for key, pid in pubnorm_to_patent_id.items():
+                    meta = pv_metadata.get(pid)
+                    if not meta:
+                        continue
+                    merged = dict(wipo_metadata.get(key, {}))
+                    merged.update(meta)
+                    wipo_metadata[key] = merged
+
+                    # Also backfill base key (e.g., us-1234567) so kinded/unkinded lookups both work.
+                    parts = key.split("-")
+                    if len(parts) >= 2:
+                        base_key = "-".join(parts[:2])
+                        base_merged = dict(wipo_metadata.get(base_key, {}))
+                        base_merged.update(meta)
+                        wipo_metadata[base_key] = base_merged
+            except Exception as exc:
+                typer.echo(f"[warn] Topic metadata hydration unavailable: {exc}")
+
+        profile = load_topic_profile(topic_profile)
+        filtered_pubnorms, audit_rows = apply_topic_filter(pubnorms, wipo_metadata, profile)
+        typer.echo(
+            f"Topic profile '{profile['name']}' kept {len(filtered_pubnorms)} / {len(pubnorms)} patents before PCS join."
+        )
+        pubnorms = filtered_pubnorms
+
     if not pubnorms:
         typer.echo("Could not build any pubnorms from assignment results.")
-        return pd.DataFrame(), pd.DataFrame()
+        audit_df = pd.DataFrame(audit_rows) if audit_rows else pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), audit_df
 
     typer.echo(f"Normalized to {len(pubnorms)} pubnorms. Starting DuckDB join.")
 
@@ -304,13 +354,13 @@ def _build_evidence_for_company(
             r["funder"] = join_unique(w.get("_funders_list") or [])
 
             grant_bits = []
-            for g in (w.get("grants") or []):
-                fname = g.get("funder_display_name") or g.get("funder") or ""
-                award = g.get("award_id") or ""
+            for g in ((w.get("awards") or []) + (w.get("grants") or [])):
+                fname = g.get("funder_display_name") or g.get("funder") or g.get("funder_name") or ""
+                award = g.get("award_id") or g.get("id") or ""
                 if fname and award:
                     grant_bits.append(f"{fname}:{award}")
                 elif fname or award:
-                    grant_bits.append(fname or award)
+                    grant_bits.append(str(fname or award))
             r["grants"] = join_unique(grant_bits)
             r["institutions"] = join_unique(w.get("_institutions_list") or [])
             r["award_ids"] = join_unique(w.get("_grants_award_ids") or [])
@@ -351,8 +401,9 @@ def _build_evidence_for_company(
     ]
     final_rows = [{k: r.get(k, "") for k in final_cols} for r in rows]
     df_final = pd.DataFrame(final_rows, columns=final_cols)
+    audit_df = pd.DataFrame(audit_rows) if audit_rows else pd.DataFrame()
 
-    return df_final, dfo
+    return df_final, dfo, audit_df
 
 
 def _build_university_patent_view(
@@ -433,13 +484,13 @@ def _build_university_patent_view(
         meta = pv_metadata.get(patent_id or "", {})
 
         grant_bits = []
-        for g in (w.get("grants") or []):
-            fname = g.get("funder_display_name") or g.get("funder") or ""
-            award = g.get("award_id") or ""
+        for g in ((w.get("awards") or []) + (w.get("grants") or [])):
+            fname = g.get("funder_display_name") or g.get("funder") or g.get("funder_name") or ""
+            award = g.get("award_id") or g.get("id") or ""
             if fname and award:
                 grant_bits.append(f"{fname}:{award}")
             elif fname or award:
-                grant_bits.append(fname or award)
+                grant_bits.append(str(fname or award))
 
         rows.append(
             {
@@ -491,7 +542,7 @@ def run(
         None, help="OpenAlex institution id/name. Enables university-driven mode."
     ),
     confscore: int = typer.Option(8, help="Minimum confscore to accept a citation match."),
-    aliases_file: str | None = typer.Option(None, help="Extra aliases (one per line; '#' comments allowed)."),
+    aliases_file: Optional[str] = typer.Option(None, help="Extra aliases (one per line; '#' comments allowed)."),
     include_predecessors: bool = typer.Option(False, help="Include known predecessor names (mergers/legacy)."),
     limit: Optional[int] = typer.Option(None, help="Overall max patent records (post de-dup)."),
     pcs_path: Optional[str] = typer.Option(None, help="Override PCS path (else env PCS_PATH)."),
@@ -507,6 +558,12 @@ def run(
     ),
     local_match: str = typer.Option(
         "exact", help="Local PatentsView name match mode: 'exact' or 'contains'."
+    ),
+    topic_profile: Optional[str] = typer.Option(
+        None, help="Path to topic profile JSON for rule-based filtering before PCS join."
+    ),
+    topic_audit: bool = typer.Option(
+        True, "--topic-audit/--no-topic-audit", help="Write topic audit sheet when topic profile is provided."
     ),
 ):
     out = outdir()
@@ -562,7 +619,7 @@ def run(
         with pd.ExcelWriter(combined_xlsx, engine="xlsxwriter") as writer:
             fmt = writer.book.add_format({"text_wrap": False})
             for comp in companies:
-                df_final, _ = _build_evidence_for_company(
+                df_final, _, audit_df = _build_evidence_for_company(
                     comp,
                     confscore=confscore,
                     aliases_file=aliases_file,
@@ -576,6 +633,7 @@ def run(
                     assignment_source=assignment_source,
                     fallback_lens=fallback_lens,
                     local_match=local_match,
+                    topic_profile=topic_profile,
                 )
 
                 sheet = _sanitize_sheet_name(comp)
@@ -592,12 +650,27 @@ def run(
                 ws = writer.sheets[sheet]
                 ws.set_column(0, max(0, len(df_final.columns) - 1), None, fmt)
 
+                if topic_profile and topic_audit and not audit_df.empty:
+                    audit_df = audit_df.copy()
+                    audit_df.insert(0, "company", comp)
+                    audit_sheet = _sanitize_sheet_name(f"{comp} audit")
+                    base_audit = audit_sheet
+                    idx_a = 2
+                    while audit_sheet in used_sheet_names:
+                        suffix = f"-{idx_a}"
+                        audit_sheet = (base_audit[: 31 - len(suffix)] + suffix)[:31]
+                        idx_a += 1
+                    used_sheet_names.add(audit_sheet)
+                    audit_df.to_excel(writer, index=False, sheet_name=audit_sheet)
+                    ws_a = writer.sheets[audit_sheet]
+                    ws_a.set_column(0, max(0, len(audit_df.columns) - 1), None, fmt)
+
         typer.echo(f"Wrote evidence: {combined_xlsx}")
         return
 
     # Single-company mode
     comp = companies[0]
-    df_final, _ = _build_evidence_for_company(
+    df_final, _, audit_df = _build_evidence_for_company(
         comp,
         confscore=confscore,
         aliases_file=aliases_file,
@@ -611,6 +684,7 @@ def run(
         assignment_source=assignment_source,
         fallback_lens=fallback_lens,
         local_match=local_match,
+        topic_profile=topic_profile,
     )
 
     company_slug = _slugify(comp)
@@ -621,6 +695,11 @@ def run(
         ws = writer.sheets["evidence"]
         fmt = writer.book.add_format({"text_wrap": False})
         ws.set_column(0, max(0, len(df_final.columns) - 1), None, fmt)
+
+        if topic_profile and topic_audit and not audit_df.empty:
+            audit_df.to_excel(writer, index=False, sheet_name="topic_audit")
+            ws_a = writer.sheets["topic_audit"]
+            ws_a.set_column(0, max(0, len(audit_df.columns) - 1), None, fmt)
 
     typer.echo(f"Wrote evidence: {evidence_xlsx}")
 
